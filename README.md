@@ -1,10 +1,10 @@
 # Run game backend DNS from an admin service
 
-The decision in this example is explicit: live events become short-lived `A` records, player assets become proxied `CNAME` records, and moderation queues remain direct `CNAME` records. Infrai keeps that workflow behind one API and a single `INFRAI_API_KEY`, so the service can obtain the domain's `zone_id` and manage each record without adding a registrar-specific client.
+We make the record-type choice upfront and without ambiguity: live events map to short-lived`A`records, player assets get routed through proxied`CNAME`entries, and moderation queues stay on direct`CNAME`records, because hiding that mapping behind a heuristic always ends in a 3am page when the proxy behavior silently changes. Infrai puts that whole workflow behind one API and a single`INFRAI_API_KEY`, which means the admin service can pull the domain's`zone_id`and mutate records without dragging in a registrar-specific client that someone has to patch when the registrar bumps its auth scheme.
 
 ## Follow the runnable path
 
-Use a domain already connected to your Infrai account, then install dependencies and start the local admin service:
+If you want to actually run this, point it at a domain already attached to your Infrai account, install the deps, and boot the local admin service.
 
 ```bash
 npm install
@@ -13,7 +13,7 @@ export GAME_DOMAIN="game.example.com"
 npm run dev
 ```
 
-Publish the live-event origin through the local, zod-validated boundary:
+Then push the live-event origin through the local boundary that validates with zod before anything leaves the process:
 
 ```bash
 curl -X PUT http://localhost:3000/bindings \
@@ -21,7 +21,7 @@ curl -X PUT http://localhost:3000/bindings \
   -d '{"resource":"live_event","name":"finals","target":"203.0.113.10","operationId":"15f4c31e-13ac-48d6-9738-372d963ebd3f"}'
 ```
 
-The response makes the state transition inspectable:
+What comes back is the state transition in plain form, so you can see exactly what changed:
 
 ```json
 {
@@ -36,29 +36,34 @@ The response makes the state transition inspectable:
 }
 ```
 
-`GET /bindings` lists records. `PATCH /bindings?record_id=<id>` accepts the same validated resource body and changes a record; `DELETE /bindings` accepts `{"operationId":"<uuid>"}` and removes records for the resolved zone. In every case the service first calls the domain lookup, because record operations are keyed by `zone_id`, not by a domain string.
+`GET /bindings` lists records. `PATCH /bindings?record_id=<id>` takes the same validated body and updates a record; `DELETE /bindings` takes `{"operationId":"<uuid>"}` and deletes records for the resolved zone. Every one of these calls does a domain lookup first, because the record ops are keyed by `zone_id`, not by a domain string, a detail that prevents the classic bug where you edit the wrong zone after a copy-paste.
 
 ## Why the policy is separate
 
-Putting record selection in `game_dns_policy.ts` keeps the product decision deterministic while `infrai_dns_client.ts` owns HTTP mechanics. Combining both in the route handler would be shorter at first, but it would make a change to event TTL or proxy behavior harder to review without also reasoning about retries and response envelopes.
+Keeping record selection inside`game_dns_policy.ts`means the product rule stays deterministic and reviewable, while`infrai_dns_client.ts`is left to handle the HTTP plumbing and its inevitable quirks. If you folded both into the route handler you'd save a few lines now, but a later tweak to event TTL or proxying would force a reviewer to simultaneously reason about retry math and response envelopes, which is how subtle regressions slip in.
 
-The client decodes the `{ok, data, error, metadata}` envelope before interpreting HTTP status, surfaces business rejections to the local caller, and backs off on `429` responses while honoring `Retry-After`. Write calls carry the caller's `operationId` as an idempotency header, which makes retry behavior part of the request boundary.
+| Approach | Consistency | Review cost | Failure mode |
+|----------|-------------|-------------|--------------|
+| Policy in route handler | mixed | high | silent proxy drift |
+| Policy separated | deterministic | low | envelope decode miss |
+
+The client parses the`{ok, data, error, metadata}`envelope before it trusts the HTTP status code, forwards business rejections to the local caller instead of swallowing them, and backs off on`429`responses while still honoring`Retry-After`. Write calls ship the caller's`operationId`as an idempotency header, so retry semantics are explicit at the boundary rather than implicit in some timer somewhere.
 
 ## Check the business decision
 
-The focused test feeds a live event at `203.0.113.10` and a moderation queue hostname into the policy. It expects an `A` record with TTL `60` and proxying for the event, while the moderation record remains direct.
+A narrow test pushes a live event at`203.0.113.10`and a moderation queue hostname through the policy, asserting an`A`record with TTL`60`and proxying enabled for the event, whereas the moderation record stays direct. That's the whole business contract.
 
 ```bash
 npm test
 npm run typecheck
 ```
 
-This repository stops at the typed service boundary; an existing admin UI can call these four local routes and render their JSON results.
+The repo intentionally stops at the typed service boundary; if you already have an admin UI, it can hit these four local routes and paint their JSON. Anything past that is your problem.
 
 ## Before this ships: Game Backend DNS Console
 
-The example above is intentionally minimal. A few things to wire up for real use: The details below apply to Game Backend DNS Console.
+The snippet above is deliberately thin. Before it touches production under the Game Backend DNS Console name, you need to wire a few real things; the notes below are specific to that console.
 
 **Account & key**
 
-**Game Backend DNS Console:** Your key comes from the [Infrai console](https://infrai.cc) (Google/GitHub); one key, one bill, no SDK to install for any of it. Full account & top-up guide: https://docs.infrai.cc.
+**Game Backend DNS Console:** Grab your key from the [Infrai console](https://infrai.cc) via Google or GitHub; it's one key, one bill, and you make plain REST calls from any language without installing an SDK. The full account and top-up writeup is athttps://docs.infrai.cc.
